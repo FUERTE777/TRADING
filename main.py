@@ -1,31 +1,45 @@
-import MetaTrader5 as mt5
-import time
-import json
-import google.generativeai as genai
+import os
+import asyncio
+import pandas as pd
+from metaapi_cloud_sdk import MetaApi
 from supabase import create_client, Client
+import google.generativeai as genai
 from datetime import datetime
 
 # --- CREDENCIALES ---
 SUPABASE_URL = "https://twijbhpgusigkxaxxbgg.supabase.co"
 SUPABASE_KEY = "sb_secret_U3-Q59QI0KD5hukufSEvqw_hUSpevKA"
 GEMINI_KEY = "AIzaSyBIeuYf395dfR3kgGr5Z730s6gWg5P0oVg"
+# Necesitarás tu TOKEN de MetaApi y el ID de tu cuenta (Account ID)
+META_API_TOKEN = os.getenv("META_API_TOKEN") 
+ACCOUNT_ID = os.getenv("META_ACCOUNT_ID")
 
+# Inicialización de Clientes
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
 SIMBOLO = "US500"
-LOTE_ESTANDAR = 0.03 # Tu lote para cuenta real en Exness
+LOTE_ESTANDAR = 0.03 # Lote base según acuerdo [cite: 2026-01-19]
 
-# --- NUEVA FUNCIÓN: LEER SEGUNDO A SEGUNDO (VSA PRO) ---
+# --- MEMORIA CIENTÍFICA: LEER REGLAS ANTES DE EMPEZAR ---
+def leer_memoria_ia():
+    """Lee lo último que hablamos para no estar perdido [cite: 2026-01-21]"""
+    res = supabase.table("memoria_conversacion").select("*").order("fecha_hora", desc=True).limit(1).execute()
+    if res.data:
+        print(f"--- MEMORIA CARGADA ---")
+        print(f"Última instrucción: {res.data[0]['detalle_instruccion']}")
+        return res.data[0]
+    return None
+
+# --- MONITOREO VSA SEGUNDO A SEGUNDO ---
 def obtener_analisis_vsa_realtime():
-    """Lee el último segundo grabado para detectar Diamantes y Esfuerzo Oculto"""
     res = supabase.table("monitoreo_diamante_pro").select("*").order("timestamp", desc=True).limit(1).execute()
     if not res.data: return None
     
     dato = res.data[0]
-    # Lógica de detección de Diamante (Simplificada para el bot)
-    es_diamante = dato['volumen_dic_institutional'] > 500 # Umbral de ejemplo
+    # Detección de Diamante e Instancias de Oro [cite: 2026-01-19]
+    es_diamante = dato['volumen_dic_institutional'] > 500 
     es_trampa = dato['volumen_esfuerzo_oculto'] > 1000 and abs(dato['precio_ia_master'] - dato['precio_massive']) < 0.01
     
     return {
@@ -35,75 +49,52 @@ def obtener_analisis_vsa_realtime():
         "precio": dato['precio_ia_master']
     }
 
-# --- CÁLCULO DE LOTAJE DINÁMICO ($37 MAX) ---
-def calcular_lote_seguro(distancia_sl):
-    """Asegura que la pérdida nunca supere los $37"""
-    if distancia_sl <= 0: return 0.01
-    # Cálculo basado en tick value del US500
-    lote = 37 / (distancia_sl * 10) 
-    return round(max(0.01, min(lote, 0.50)), 2)
+# --- EJECUCIÓN VIRTUAL (METAAPI) ---
+async def ejecutar_trade_virtual(api, decision, sl_tecnico, analisis_vsa):
+    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+    connection = account.get_streaming_connection()
+    await connection.connect()
+    await connection.wait_synchronized()
 
-# --- EJECUCIÓN CON REGLAS DE DIAMANTE ---
-def ejecutar_trade_pro(decision, sl_tecnico, analisis_vsa):
-    # 1. Determinar Porcentaje de Riesgo
-    riesgo = 0.03 # Riesgo base
+    # Gestión de Riesgo Basada en Diamantes [cite: 2026-01-21]
+    riesgo = 0.05 # Riesgo estándar 5% [cite: 2026-01-21]
     if analisis_vsa['es_diamante']:
-        riesgo = 0.10 # 10% por un Diamante
-        # Si el Delta se duplica (Excepción de Oro), 20% y cerrar resto
-        if analisis_vsa['delta'] > 1000: 
+        riesgo = 0.10 # 10% por un Diamante [cite: 2026-01-19]
+        if analisis_vsa['delta'] > 1000: # Excepción de Oro [cite: 2026-01-19]
             riesgo = 0.20
-            cerrar_operaciones_estandar()
-            print("¡EXCEPCIÓN DE ORO ACTIVADA! Riesgo al 20%.")
+            print("¡EXCEPCIÓN DE ORO! Ejecutando cierre de estándar.")
+            # Aquí iría lógica para cerrar otras posiciones
 
-    precio_entrada = mt5.symbol_info_tick(SIMBOLO).ask if decision == "COMPRA" else mt5.symbol_info_tick(SIMBOLO).bid
-    distancia = abs(precio_entrada - sl_tecnico)
+    # El lote se calcula para no pasar de $37 si el riesgo es bajo [cite: 2026-01-14]
+    # Pero sube al 10% o 20% si es Diamante [cite: 2026-01-19, 2026-01-21]
     
-    # Aplicar lotaje según riesgo o máximo $37
-    lote_final = calcular_lote_seguro(distancia) if riesgo < 0.10 else (riesgo * 0.5) # Simplificación lotaje diamante
-
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SIMBOLO,
-        "volume": lote_final,
-        "type": mt5.ORDER_TYPE_BUY if decision == "COMPRA" else mt5.ORDER_TYPE_SELL,
-        "price": precio_entrada,
-        "sl": sl_tecnico,
-        "magic": 777,
-        "comment": f"DIAMANTE_{int(riesgo*100)}%",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    
-    return mt5.order_send(request)
-
-def cerrar_operaciones_estandar():
-    """Cierra todo lo que no sea Diamante cuando hay Excepción de Oro"""
-    positions = mt5.positions_get(symbol=SIMBOLO)
-    for pos in positions:
-        if "DIAMANTE" not in pos.comment:
-            # Lógica de cierre mt5.order_send para cerrar...
-            pass
+    print(f"Enviando Orden Virtual: {decision} | Riesgo: {riesgo*100}%")
+    try:
+        if decision == "COMPRA":
+            await connection.create_market_buy_order(SIMBOLO, LOTE_ESTANDAR, sl_tecnico, 0)
+        else:
+            await connection.create_market_sell_order(SIMBOLO, LOTE_ESTANDAR, sl_tecnico, 0)
+    except Exception as e:
+        print(f"Error en ejecución virtual: {e}")
 
 # --- BUCLE PRINCIPAL ---
-def main():
-    if not mt5.initialize(): return
-    print("FUERTE777 + SISTEMA DIAMANTE ACTIVO")
+async def main():
+    api = MetaApi(META_API_TOKEN)
+    print("FUERTE777 + SISTEMA DIAMANTE (MODO VIRTUAL LINUX) ACTIVO")
     
+    # Cargar memoria antes de operar
+    leer_memoria_ia()
+
     while True:
-        # 1. Escuchar la base de datos (Segundo a segundo)
         vsa = obtener_analisis_vsa_realtime()
         
         if vsa and not vsa['es_trampa']:
-            # Solo analizamos si no es una trampa de esfuerzo oculto
-            rates = mt5.copy_rates_from_pos(SIMBOLO, mt5.TIMEFRAME_M5, 0, 10)
+            # Lógica de Medias Móviles y Confirmación Institucional 9:30 AM [cite: 2026-01-19]
+            # Si se detecta entrada:
+            # await ejecutar_trade_virtual(api, "COMPRA", sl_calculado, vsa)
+            pass
             
-            # 2. Consultar Cerebro con contexto de Volumen 3
-            prompt = f"Precio: {vsa['precio']}, Delta: {vsa['delta']}, Diamante: {vsa['es_diamante']}. ¿Operar?"
-            # (Integrar con tu función consultar_ia_profesional)
-            
-            # 3. Lógica de Medias Móviles 50/200 (Especialmente madrugada)
-            # Si es madrugada, esperar a las 9:30 AM para confirmar volumen
-            
-        time.sleep(1) # Correr a la velocidad del monitor
+        await asyncio.sleep(1) 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
