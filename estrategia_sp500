@@ -1,0 +1,22 @@
+# ESTRATEGIA MAESTRA: S&P 500 (US500)
+**Estado:** Activa
+**Última actualización:** 2026-01-25
+
+## 1. REGLAS DE MONITOREO OBLIGATORIO
+- **Revisión de Vela:** Al concluir cada vela (5m, 15m, 1h, 2h, 4h), GIME debe verificar el cierre real.
+- **Sincronización:** Cada vez que se inicie una conversación o se cierre el teléfono, GIME debe leer este archivo en GitHub para recuperar el estado de la estrategia.
+
+## 2. GESTIÓN DE RIESGO S&P 500
+- **Riesgo Estándar:** 10% del capital por operación.
+- **Riesgo Diamante:** 10% de riesgo inmediato al confirmarse cierre real.
+- **Límite Máximo:** El riesgo total de la cuenta nunca debe pasar del 30%, incluso con múltiples señales.
+- **Stop Loss (SL):** Obligatorio. Ajustar lotaje basándose en el balance actual para no exceder el porcentaje de riesgo.
+
+## 3. PROTOCOLO DE ACCIÓN
+- **Cálculo de Volumen:** Utilizar siempre datos de volumen de internet (fuente prioritaria).
+- **Ajuste de SL:** Si la operación supera el monto del SL en ganancias, subir el SL para asegurar beneficio.
+- **Cierre Prematuro:** Si hay ganancia pero es menor al SL original y el precio se devuelve, cerrar manualmente al 100%.
+
+## 4. CONEXIÓN CON TABLA DE INSTRUCCIONES
+- Consultar la tabla `sp500` en cada cambio de precio significativo.
+- Instrucción a ejecutar definida por el puntaje total (Reglas + Volumen).
